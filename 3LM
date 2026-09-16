@@ -1,1 +1,597 @@
+import uuid
+import pandas as pd
+from typing import Dict
+from datetime import datetime, date
+from database.models import QC_Status, EmployeeAccessReview
+import routine_engine.utils.logger as logger_module
+from routine_engine.io_layer import IOLayer
+import database.data_model as data_model
+from database.db_helper_method import normalize_yes_no_to_bool
+from typing import get_origin, get_args, Union, Any
+
+logger = logger_module.setup_logger(__name__)
+
+all_col: list = (
+    list(data_model.EmployeeInfo.model_fields.keys())
+    + list(data_model.QCColumn.model_fields.keys())
+    + list(data_model.ManualData.model_fields.keys())
+)
+
+logger = logger_module.setup_logger(__name__)
+
+cols_to_remove = [
+    "apps_reviewed_by_manager",
+    "manager_response",
+    "manager_response_date",
+    "ticket_creation_date",
+    "ticket_no",
+    "control_as_per_ticket",
+    "qc_status",
+    "send_mail",
+    "comment",
+    "evidence",
+    "within_30_days",
+    "approved_by_manager",
+    "failure_reason",
+    "business_justification",
+    "attachments",
+    "peer_review_status",
+    "peer_review_by",
+    "peer_review_date",
+    "peer_review_comment",
+    "provisioning_employee_deletion_date",
+]
+
+boolean_cols = ["send_mail", "within_30_days", "approved_by_manager"]
+
+failure_reason_list = [
+    "NEXT_WEEK_DATA_OVERLAP",
+    "TICKET_PROCESSING_ISSUE",
+    "SLA_EXCEEDED_30_DAYS",
+    "NOT_PRESENT_IN_TAR",
+]
+
+claimops_send_mail = ["Yes", "No"]
+
+
+def run(context: Dict) -> Dict:
+    IO_object = IOLayer()
+    final_df = {}
+    result_transfer = {}
+    tar_data = context["tar_data"]
+
+    benefit_data = context["delta_claimsops_yes"][
+        context["delta_claimsops_yes"]["GroupName"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        == "gg-claimsops_benefit"
+    ].copy()
+
+    if benefit_data.empty:
+        logger.info(
+            "No GG-ClaimsOps_Benefit records found in delta_claimsops_yes"
+        )
+        final_t_claimsops = benefit_data.copy()
+    else:
+        final_t_claimsops = benefit_data.apply(
+            qc_transfer_claimsops,
+            validation=tar_data,
+            context=context,
+            column_id_name="Name",
+            axis=1,
+        )
+
+    final_t_claimsops = apply_preprocessing_columns(
+        final_t_claimsops,
+        land_id_colname="SAMAccountName",
+        access_item_cols=["GroupName"],
+        sub_app_name="ClaimsOps",
+    )
+
+    final_t_claimsops = convert_within_30_to_yes_no(final_t_claimsops)
+    final_t_claimsops["id"] = [
+        str(uuid.uuid4()) for _ in range(len(final_t_claimsops))
+    ]
+    final_t_claimsops = get_filtered_datacolumn(data_frame=final_t_claimsops)
+    result_transfer["final_t_claimsops"] = final_t_claimsops[
+        "qc_status"
+    ].value_counts() if "qc_status" in final_t_claimsops.columns else pd.Series(dtype=int)
+    final_t_claimsops = format_model_date_columns_mmddyyyy(final_t_claimsops)
+    final_t_claimsops = normalize_yes_no_to_bool(
+        final_t_claimsops,
+        boolean_cols,
+    )
+
+    result = pd.DataFrame.from_dict(result_transfer, orient="index")
+    result.index.name = "application_name"
+    result.reset_index(inplace=True)
+
+    claimsops_current_report_date = context["claimsops_current_report_date"]
+    transfer_report_date = context["transfer_report_date"]
+    tar_report_date = context["tar_report_date"]
+
+    final_df["qc_result"] = result
+    final_df[f"tran_{transfer_report_date}"] = context["transfer"]
+    final_df[f"tar_report_{tar_report_date}"] = context["tar_data"]
+    final_df[
+        f"claimsops_{claimsops_current_report_date}"
+    ] = context["delta_claimsops"].drop(columns=cols_to_remove, errors="ignore")
+
+    final_df["qc_claimsops"] = final_t_claimsops
+
+    if not final_t_claimsops.empty:
+        write_to_db(final_t_claimsops)
+    else:
+        logger.info("No ClaimsOps validation rows available to write to DB")
+
+    try:
+        IO_object.write_excel(
+            destination_path=context["properties"]["output_path"],
+            data=final_df,
+        )
+        logger.info(
+            f"Output written to local at path: "
+            f"{context['properties']['output_path']}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to write output to local path "
+            f"'{context['properties']['output_path']}': {str(e)}"
+        )
+
+    return context
+
+
+def write_to_db(data):
+    """
+    Write data to db
+
+    Params:
+        data: dict :: data to write to db
+    """
+    io_layer = IOLayer()
+    try:
+        records = []
+        for _, row in data.iterrows():
+            employee_access_review = EmployeeAccessReview(
+                lan_id=row.get("lan_id"),
+                first_name=row.get("first_name", ""),
+                last_name=row.get("last_name") if row.get("last_name") else "",
+                email_address=row.get("email_address"),
+                emp_effective_termination_transfer_date=_parse_date(
+                    row.get("emp_effective_termination_transfer_date", None)
+                ),
+                title=row.get("title"),
+                subapplication=row.get("subapplication"),
+                control=row.get("control"),
+                active_inactive_transfer_report_date=_parse_date(
+                    row.get("active_inactive_transfer_report_date", None)
+                ),
+                active_user_report_date=_parse_date(
+                    row.get("active_user_report_date", None)
+                ),
+                provisioning_employee_deletion_date=_parse_date(
+                    row.get("provisioning_employee_deletion_date", None)
+                ),
+                apps_reviewed_by_manager=row.get("apps_reviewed_by_manager", ""),
+                manager_response=row.get("manager_response", ""),
+                manager_response_date=_parse_date(
+                    row.get("manager_response_date", None)
+                ),
+                ticket_no=row.get("ticket_no", ""),
+                ticket_creation_date=_parse_date(
+                    row.get("ticket_creation_date")
+                    if row.get("ticket_creation_date")
+                    else None
+                ),
+                control_as_per_ticket=row.get("control_as_per_ticket", ""),
+                qc_status=str(row.get("qc_status", ""))
+                if str(row.get("qc_status", "")) in ["Passed", "Manual QC"]
+                else QC_Status.MANUAL_QC,
+                send_mail=str(row.get("send_mail"))
+                if str(row.get("send_mail")) != "nan"
+                else claimops_send_mail[1],
+                comment=row.get("comment", ""),
+                evidence=row.get("evidence", ""),
+                within_30_days=row.get("within_30_days")
+                if str(row["within_30_days"]) != "nan"
+                and isinstance(row["within_30_days"], bool)
+                else False,
+                approved_by_manager=row.get("approved_by_manager")
+                if str(row.get("approved_by_manager")) != "nan"
+                else False,
+                failure_reason=row.get("failure_reason", ""),
+                business_justification=row.get("business_justification", ""),
+                remarks=row.get("remarks", ""),
+                attachments=row.get("attachments", ""),
+                peer_review_comment=row.get("peer_review_comment", ""),
+                peer_review_status=row.get("peer_review_status", ""),
+                peer_review_by=row.get("peer_review_by", ""),
+                peer_review_date=_parse_date(row.get("peer_review_date", None)),
+                access_item=str(row.get("access_item", "Unknown"))
+                if str(row.get("access_item")) not in ["nan", ""]
+                else "Unknown",
+            )
+            records.append(employee_access_review)
+
+        if records:
+            io_layer.write_to_database(records)
+            logger.info(f"Successfully wrote {len(records)} rows to the database")
+        else:
+            logger.info("No records to write to the database")
+    except Exception as e:
+        logger.error(f"Failed to write to the database: {e}")
+        raise
+
+
+def get_first_last_word(name_str):
+    cleaned = str(name_str).strip().lower()
+    words = [w for w in cleaned.split() if w]
+
+    if not words:
+        return ""
+    if len(words) == 1:
+        return words[0]
+
+    first = words[0]
+    last = words[-1]
+
+    return f"{first} {last}"
+
+
+def _parse_date(value: str):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+
+    value = str(value).strip()
+    if not value:
+        return None
+
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+    ):
+        try:
+            return datetime.strptime(value.strip(), fmt).date()
+        except ValueError:
+            continue
+
+    return value.strip()
+
+
+def qc_transfer_claimsops(
+    row,
+    validation: pd.DataFrame,
+    context: dict,
+    column_id_name: str,
+):
+    try:
+        manager_response = ""
+        out_comment = ""
+        curr_qc_status = "Manual QC"
+        send_mail = claimops_send_mail[0]
+        mail_status = ""
+        prf_val = ""
+        compaign_data = []
+        failure_reason_data = []
+
+        if str(row["Status"]).lower() == "yes":
+            decision_data = ""
+
+            val_clean = validation.copy()
+
+            val_clean = val_clean[
+                val_clean["Source Name"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                == "active directory"
+            ].copy()
+
+            for col in ["Employee", "Account Name", "Access_Item"]:
+                val_clean[col] = (
+                    val_clean[col]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                )
+
+            val_clean = val_clean.set_index(
+                ["Employee", "Account Name", "Access_Item"]
+            )
+
+            emp_val = str(row["Name"]).strip().lower()
+            account_val = str(row["SAMAccountName"]).strip().lower()
+            prf_val = str(row["GroupName"]).strip().lower()
+
+            lookup_key = (emp_val, account_val, prf_val)
+
+            if lookup_key not in val_clean.index:
+                row["provisioning_employee_deletion_date"] = ""
+                out_comment = (
+                    f"Name {row['Name']}, "
+                    f"SAMAccountName {row['SAMAccountName']}, "
+                    f"GroupName {row['GroupName']} not present in "
+                    f"TAR report {context['tar_report_date']} "
+                    f"under Source Name Active Directory"
+                )
+                failure_reason_data.append(failure_reason_list[3])
+
+            else:
+                decision_data = val_clean.loc[lookup_key, "Decision"]
+
+                if isinstance(decision_data, pd.Series):
+                    decision_data = decision_data.iloc[0]
+
+                manager_response = str(decision_data).split(".")[-1]
+
+                if decision_data and "approve" in str(decision_data).lower():
+                    curr_qc_status = "Passed"
+                    send_mail = claimops_send_mail[1]
+                    row["evidence"] = context.get("tar_report_filepath", "")
+
+                elif decision_data and "revoke" in str(decision_data).lower():
+                    # Follow the Salesforce validator pattern:
+                    # normalize current/next data, check employee presence,
+                    # then compare a concatenated multi-column key.
+                    match_cols_curr = [
+                        "Name",
+                        "SAMAccountName",
+                        "GroupName",
+                    ]
+                    match_cols_next = [
+                        "Name",
+                        "SAMAccountName",
+                        "GroupName",
+                    ]
+
+                    curr_claimsops_df = context["claimsops"]
+                    next_claimsops_df = context.get(
+                        "next_claimsops",
+                        context.get("claimops_next"),
+                    )
+
+                    if next_claimsops_df is None:
+                        curr_qc_status = "Manual QC"
+                        send_mail = claimops_send_mail[0]
+                        row["provisioning_employee_deletion_date"] = ""
+                        failure_reason_data.append(failure_reason_list[0])
+                        out_comment += (
+                            "TAR Decision is Revoke, but next week ClaimsOps "
+                            "report is not available in context"
+                        )
+                    else:
+                        for col in match_cols_curr:
+                            curr_claimsops_df[col] = (
+                                curr_claimsops_df[col]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .str.lower()
+                            )
+
+                        for col in match_cols_next:
+                            next_claimsops_df[col] = (
+                                next_claimsops_df[col]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .str.lower()
+                            )
+
+                        next_week_employees = set(
+                            next_claimsops_df["Name"].unique()
+                        )
+                        exists_next_week = curr_claimsops_df["Name"].isin(
+                            next_week_employees
+                        )
+
+                        curr_keys = (
+                            curr_claimsops_df["Name"]
+                            + "||"
+                            + curr_claimsops_df["SAMAccountName"]
+                            + "||"
+                            + curr_claimsops_df["GroupName"]
+                        )
+                        next_keys = set(
+                            next_claimsops_df["Name"]
+                            + "||"
+                            + next_claimsops_df["SAMAccountName"]
+                            + "||"
+                            + next_claimsops_df["GroupName"]
+                        )
+                        row_matches_next_week = curr_keys.isin(next_keys)
+
+                        # .apply() keeps the source row index. Select only the
+                        # current employee's boolean result from the two Series.
+                        if row.name in curr_claimsops_df.index:
+                            employee_exists = bool(
+                                exists_next_week.loc[row.name]
+                            )
+                            complete_key_exists = bool(
+                                row_matches_next_week.loc[row.name]
+                            )
+                        else:
+                            row_key = (
+                                str(row["Name"]).strip().lower()
+                                + "||"
+                                + str(row["SAMAccountName"]).strip().lower()
+                                + "||"
+                                + str(row["GroupName"]).strip().lower()
+                            )
+                            employee_exists = (
+                                str(row["Name"]).strip().lower()
+                                in next_week_employees
+                            )
+                            complete_key_exists = row_key in next_keys
+
+                        if employee_exists and complete_key_exists:
+                            curr_qc_status = "Manual QC"
+                            send_mail = claimops_send_mail[0]
+                            row["provisioning_employee_deletion_date"] = ""
+                            failure_reason_data.append(failure_reason_list[0])
+                            out_comment += (
+                                "Current week Name, SAMAccountName, GroupName "
+                                "present in next week report"
+                            )
+                        else:
+                            curr_qc_status = "Passed"
+                            send_mail = claimops_send_mail[1]
+                            row["evidence"] = context.get(
+                                "tar_report_filepath",
+                                "",
+                            )
+
+                else:
+                    row["provisioning_employee_deletion_date"] = ""
+                    if not decision_data:
+                        decision_data = "blank"
+                    out_comment += (
+                        f"decision data should be approve or revoke "
+                        f"but got {decision_data}"
+                    )
+
+    except Exception as e:
+        logger.error(
+            f"found exception in ClaimOps transfer qc_transfer_claimsops: {e}"
+        )
+
+    row["qc_status"] = curr_qc_status
+    row["comment"] = out_comment
+    row["send_mail"] = send_mail
+    row["manager_response"] = manager_response
+    row["control_as_per_ticket"] = "Transfer"
+    row["failure_reason"] = ", ".join(sorted(set(failure_reason_data)))
+
+    return row
+
+
+def convert_within_30_to_yes_no(df):
+    if "within_30_days" not in df.columns:
+        df["within_30_days"] = None
+
+    s = pd.to_numeric(df["within_30_days"], errors="coerce")
+    df["within_30_days"] = (
+        s.where(
+            s.isna(),
+            s.map(lambda x: "YES" if x < 30 else "NO"),
+        )
+    )
+    return df
+
+
+def _is_date_like_annotation(annotation: Any) -> bool:
+    if annotation is date:
+        return True
+    origin = get_origin(annotation)
+    if origin is Union:
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        return len(args) == 1 and args[0] is date
+    return False
+
+
+def get_model_date_columns() -> list:
+    models = (
+        data_model.EmployeeInfo,
+        data_model.QCColumn,
+        data_model.ManualData,
+    )
+    date_columns = []
+    for model in models:
+        for field_name, field_info in model.model_fields.items():
+            if _is_date_like_annotation(field_info.annotation):
+                date_columns.append(field_name)
+    return list(dict.fromkeys(date_columns))
+
+
+def format_model_date_columns_mmddyyyy(
+    data_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    date_columns = get_model_date_columns()
+    for col in date_columns:
+        if col not in data_frame.columns:
+            continue
+        parsed_dates = pd.to_datetime(data_frame[col], errors="coerce")
+        data_frame[col] = parsed_dates.dt.strftime("%m/%d/%Y")
+        data_frame.loc[parsed_dates.isna(), col] = None
+    return data_frame
+
+
+def get_filtered_datacolumn(data_frame):
+    for col in all_col:
+        if col not in data_frame.columns:
+            data_frame[col] = None
+
+    final_df = data_frame[all_col]
+    return final_df
+
+
+def apply_preprocessing_columns(
+    df,
+    land_id_colname,
+    access_item_cols,
+    sub_app_name,
+):
+    if df.empty:
+        for col in all_col:
+            if col not in df.columns:
+                df[col] = None
+        return df
+
+    name_split = (
+        df["Employee Last Name,First"]
+        .fillna("")
+        .str.strip()
+        .str.split(",")
+    )
+
+    df["first_name"] = (
+        name_split.str[1:].str.join(" ").str.strip(",")
+    )
+    df["last_name"] = name_split.str[0].str.strip(",")
+
+    df["lan_id"] = df[land_id_colname]
+
+    if "Employee Email" in df.columns:
+        df["email_address"] = df["Employee Email"]
+    elif "transfer_employee_email" in df.columns:
+        df["email_address"] = df["transfer_employee_email"]
+    elif "email_address" not in df.columns:
+        df["email_address"] = ""
+
+    df["emp_effective_termination_transfer_date"] = df[
+        "Effective Date"
+    ]
+
+    if "active_inactive_transfer_report_date" not in df.columns:
+        df["active_inactive_transfer_report_date"] = None
+
+    if "Manager LANID" in df.columns:
+        df["approved_by_manager"] = df["Manager LANID"]
+    elif "transfer_manager_lanid" in df.columns:
+        df["approved_by_manager"] = df["transfer_manager_lanid"]
+    elif "approved_by_manager" not in df.columns:
+        df["approved_by_manager"] = None
+
+    if str(sub_app_name).lower() == "sales":
+        col1 = df[access_item_cols[0]].fillna("").astype(str)
+        col2 = df[access_item_cols[1]].fillna("").astype(str)
+        df["access_item"] = (col1 + " / " + col2).str.strip(" / ")
+    else:
+        df["access_item"] = df[access_item_cols[0]]
+    df["subapplication"] = sub_app_name
+    df["control"] = "Transfer"
+
+    return df
 
