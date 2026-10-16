@@ -1,1 +1,394 @@
+Transfer 
+
+import os
+import re
+from datetime import datetime, date
+from typing import Dict
+
+import pandas as pd
+
+import database.data_model as data_model
+from routine_engine.io_layer import IOLayer
+from routine_engine.utils.logger import setup_logger
+
+
+logger = setup_logger(__name__)
+
+qc_columns: list = (
+    list(data_model.QCColumn.model_fields.keys())
+    + list(data_model.ManualData.model_fields.keys())
+)
+
+
+def run(context: Dict) -> Dict:
+    """Oracle Transfer Delta."""
+
+    logger.info("Starting Oracle Transfer Delta process.")
+    IO_object = IOLayer()
+
+    properties = context["properties"]
+    input_files = properties["input_files"]
+
+    oracle_current_report_date = get_date_from_filename(
+        input_files["oracle_current_week_report"]
+    )
+
+    if not oracle_current_report_date:
+        sheets = IO_object.read_excel(
+            input_files["oracle_current_week_report"], header=None, nrows=5
+        )
+        oracle_current_report_date = get_report_date_from_heading(
+            sheets, input_files["oracle_current_week_report"]
+        )
+
+    oracle_next_report_date = get_date_from_filename(
+        input_files["oracle_next_week_report"]
+    )
+
+    if not oracle_next_report_date:
+        sheets = IO_object.read_excel(
+            input_files["oracle_next_week_report"], header=None, nrows=5
+        )
+        oracle_next_report_date = get_report_date_from_heading(
+            sheets, input_files["oracle_next_week_report"]
+        )
+
+    transfer_report_date = get_date_from_filename(
+        input_files["transfer_report"]
+    )
+
+    context["oracle_current_report_date"] = oracle_current_report_date
+    context["oracle_next_report_date"] = oracle_next_report_date
+    context["transfer_report_date"] = transfer_report_date
+
+    for context_key, input_key, required_columns in (
+        ("oracle", "oracle_current_week_report", {"User Name"}),
+        ("next_oracle", "oracle_next_week_report", {"User Name"}),
+        ("transfer", "transfer_report", {"Employee LANID", "Manager LANID", "Effective Date", "Employee Last Name,First", "Manager Name"}),
+    ):
+        # Weekly report headers are on Excel row 6.
+        sheets = IO_object.read_excel(
+            input_files[input_key],
+            skiprows=5 if context_key in ("oracle", "next_oracle") else 0,
+        )
+        context[context_key] = select_report_sheet(sheets, required_columns, input_key)
+
+    context["delta_oracle"] = extract_and_merge_df(
+        left_df=context["oracle"],
+        right_df=context["transfer"][
+            [
+                "Employee LANID",
+                "Manager LANID",
+                "Effective Date",
+                "Employee Last Name,First",
+                "Manager Name",
+            ]
+        ],
+        left_on="User Name",
+        right_on="Employee LANID",
+        join="left",
+        filesheet="Oracle",
+        add_qc_status=True,
+        context=context,
+    )
+
+    context["delta_oracle_yes"] = context["delta_oracle"][
+        context["delta_oracle"]["Status"] == "YES"
+    ].copy()
+
+    context["delta_oracle_no"] = context["delta_oracle"][
+        context["delta_oracle"]["Status"] == "NO"
+    ].copy()
+
+    # if properties.get("save_delta"):
+    #     output_path = properties.get("output_path")
+    #
+    #     if not output_path:
+    #         raise ValueError(
+    #             "output_path is required when save_delta is enabled"
+    #         )
+    #
+    #     if not output_path.startswith(
+    #         ("s3://", "http://", "https://")
+    #     ):
+    #         output_directory = os.path.dirname(output_path)
+    #
+    #         if output_directory:
+    #             os.makedirs(output_directory, exist_ok=True)
+    #
+    #     IO_object.write_excel(
+    #         destination_path=output_path,
+    #         data={
+    #             "Oracle": context["delta_oracle"],
+    #             "Oracle_YES": context["delta_oracle_yes"],
+    #             "Oracle_NO": context["delta_oracle_no"],
+    #         },
+    #     )
+
+    logger.info(
+        "Oracle Transfer Delta process completed successfully."
+    )
+
+    return context
+
+
+def get_report_date_from_heading(sheets, report_name):
+    """Find 'Reported as of' across heading cells, including merged cells."""
+    report_dates = set()
+    for frame in sheets.values():
+        for values in frame.itertuples(index=False, name=None):
+            heading = " ".join(str(value) for value in values if pd.notna(value))
+            match = re.search(
+                r"Reported\s+as\s+of\s*:?\s*"
+                r"(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})(?!\d)",
+                heading,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                value = match.group(1)
+                fmt = "%Y-%m-%d" if "-" in value else "%m/%d/%Y"
+                try:
+                    report_dates.add(datetime.strptime(value, fmt).date())
+                except ValueError as e:
+                    raise ValueError(f"{report_name}: invalid report heading date {value!r}") from e
+    if len(report_dates) != 1:
+        raise ValueError(
+            f"{report_name}: expected one 'Reported as of' date in the first five "
+            f"rows, found {len(report_dates)}. Include a date in the filename or heading."
+        )
+    return report_dates.pop()
+
+
+def select_report_sheet(sheets, required_columns, report_name):
+    """Find the data worksheet and normalize the headers used by validation."""
+    matches = []
+    for frame in sheets.values():
+        frame = frame.copy()
+        frame.columns = [str(column).strip() for column in frame.columns]
+        frame = frame.rename(columns={
+            "Access_item": "Access_Item",
+            "Manager Lanid": "Manager LANID",
+            "Manger Name": "Manager Name",
+            "Employee last Name, First": "Employee Last Name,First",
+        })
+        if required_columns.issubset(frame.columns):
+            if frame.columns.duplicated().any():
+                raise ValueError(f"{report_name}: duplicate column headers after normalization")
+            matches.append(frame)
+    if len(matches) != 1:
+        raise ValueError(
+            f"{report_name}: expected one worksheet with columns "
+            f"{sorted(required_columns)}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def extract_and_merge_df(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    left_on: str,
+    right_on: str,
+    join: str,
+    filesheet: str = "",
+    add_qc_status: bool = False,
+    context: Dict = None,
+) -> pd.DataFrame:
+    """Normalize LAN IDs and merge Oracle with Transfer report."""
+
+    left_df = left_df.copy()
+    right_df = right_df.copy()
+
+    left_df["_oracle_lanid_key"] = normalize_identifier_series(
+        left_df[left_on]
+    )
+
+    right_df["_transfer_lanid_key"] = normalize_identifier_series(
+        right_df[right_on]
+    )
+
+    # Blank LAN IDs must never match each other.
+    right_df = right_df[
+        right_df["_transfer_lanid_key"].notna()
+    ].copy()
+
+    # Collapse identical transfers; reject conflicting details for the same LAN ID.
+    comparison_columns = [col for col in right_df.columns if col != right_on]
+    right_df = right_df.drop_duplicates(subset=comparison_columns)
+    conflicting_ids = right_df.loc[
+        right_df["_transfer_lanid_key"].duplicated(keep=False),
+        "_transfer_lanid_key",
+    ].unique()
+    if len(conflicting_ids):
+        raise ValueError(
+            "Transfer report contains conflicting transfer rows for LAN IDs: "
+            + ", ".join(str(value) for value in conflicting_ids)
+            + ". Resolve the conflicting transfer details before running QC."
+        )
+
+    merge_df = pd.merge(
+        left_df,
+        right_df,
+        left_on="_oracle_lanid_key",
+        right_on="_transfer_lanid_key",
+        how=join,
+        indicator=True,
+        validate="m:1",
+    )
+
+    merge_df = add_qc_columns(
+        merge_df,
+        filesheet,
+        title="Oracle",
+        control="Transfer",
+        context=context,
+    )
+
+    merge_df["Status"] = (
+        merge_df["_merge"]
+        .eq("both")
+        .map({True: "YES", False: "NO"})
+    )
+
+    merge_df.loc[
+        merge_df["Status"].ne("YES"),
+        "provisioning_employee_deletion_date",
+    ] = pd.NaT
+
+    merge_df.drop(
+        columns=[
+            "_oracle_lanid_key",
+            "_transfer_lanid_key",
+            "_merge",
+        ],
+        inplace=True,
+    )
+
+    return merge_df
+
+
+def normalize_identifier_series(series: pd.Series) -> pd.Series:
+    """Normalize LANID values before comparison."""
+
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.upper()
+        .replace(
+            {
+                "": pd.NA,
+                "NAN": pd.NA,
+                "NONE": pd.NA,
+                "<NA>": pd.NA,
+            }
+        )
+    )
+
+
+def add_qc_columns(
+    merged_df: pd.DataFrame,
+    file_sheet,
+    title=None,
+    control=None,
+    context: Dict = None,
+):
+    report_context = context or {}
+    current_report_date = report_context.get("oracle_current_report_date")
+    for col in qc_columns:
+
+        if col == "subapplication":
+            merged_df[col] = file_sheet
+
+        elif col == "title":
+            merged_df[col] = title
+
+        elif col == "control":
+            merged_df[col] = control
+
+        elif col == "month":
+            merged_df[col] = current_report_date.strftime("%B") if current_report_date else ""
+
+        elif col == "row_added_on_date":
+            merged_df[col] = pd.Timestamp.today().date()
+
+        elif col == "active_user_report_date":
+            merged_df[col] = current_report_date
+
+        elif col == "active_inactive_transfer_report_date":
+            merged_df[col] = report_context.get("transfer_report_date")
+
+        elif col == "provisioning_employee_deletion_date":
+            merged_df[col] = report_context.get("oracle_next_report_date")
+
+        else:
+            merged_df[col] = ""
+
+    return merged_df
+
+
+def get_date_from_filename(filepath: str):
+    filename = os.path.basename(os.path.normpath(filepath))
+
+    patterns = [
+        (r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", "%Y-%m-%d"),
+        (r"(?<!\d)(\d{2}-\d{2}-\d{4})(?!\d)", "%m-%d-%Y"),
+        (r"(?<!\d)(\d{2}_\d{2}_\d{4})(?!\d)", "%m_%d_%Y"),
+        (r"(?<!\d)(\d{4}_\d{2}_\d{2})(?!\d)", "%Y_%m_%d"),
+        (r"(?<!\d)(\d{2}\.\d{2}\.\d{4})(?!\d)", "%m.%d.%Y"),
+        (r"(?<!\d)(\d{8})(?!\d)", "%Y%m%d"),
+        (r"(?<!\d)(\d{8})(?!\d)", "%m%d%Y"),
+    ]
+
+    all_matches = []
+
+    for pattern, fmt in patterns:
+        for match in re.finditer(pattern, filename):
+            all_matches.append(
+                {
+                    "start_pos": match.start(),
+                    "date_str": match.group(1),
+                    "fmt": fmt,
+                }
+            )
+
+    if all_matches:
+        all_matches.sort(key=lambda x: x["start_pos"])
+
+        for match_item in reversed(all_matches):
+            try:
+                return datetime.strptime(
+                    match_item["date_str"],
+                    match_item["fmt"],
+                ).date()
+
+            except ValueError:
+                continue
+
+        return ""
+
+    fallback_matches = list(
+        re.finditer(
+            r"(?<!\d)(\d{2})-(\d{2})(?!\d)",
+            filename,
+        )
+    )
+
+    if fallback_matches:
+        last_fallback = fallback_matches[-1]
+
+        month, day = map(
+            int,
+            last_fallback.groups(),
+        )
+
+        try:
+            return date(
+                datetime.now().year,
+                month,
+                day,
+            )
+
+        except ValueError:
+            pass
+
+    return ""
 
