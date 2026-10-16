@@ -1,711 +1,222 @@
-validator
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "html5lib>=1.1",
+#   "nbconvert>=7.16",
+#   "nbformat>=5.10",
+#   "pytest>=9.1.1,<10",
+#   "requests>=2.32",
+# ]
+# ///
+"""Check Markdown and notebook links with modern pytest collection APIs."""
 
-"""Oracle Transfer validation in the ClaimsOps validator structure."""
+from __future__ import annotations
 
-import uuid
+import os
 import re
-from datetime import datetime, date
+import sys
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Union, get_args, get_origin
+from urllib.parse import unquote, urlsplit
 
-import pandas as pd
-
-import database.data_model as data_model
-import routine_engine.utils.logger as logger_module
-from connectors.oracle_pdf_data_extractor import (
-    ISSUE_COLUMNS,
-    PDF_COLUMNS,
-    clean,
-    extract_oracle_pdf,
-    text,
-)
-from database.db_helper_method import normalize_yes_no_to_bool
-from database.models import QC_Status, EmployeeAccessReview
-from routine_engine.io_layer import IOLayer
+import html5lib
+import nbformat
+import pytest
+import requests
+from nbconvert.filters import markdown2html
 
 
-logger = logger_module.setup_logger(__name__)
-
-all_col: list = (
-    list(data_model.EmployeeInfo.model_fields.keys())
-    + list(data_model.QCColumn.model_fields.keys())
-    + list(data_model.ManualData.model_fields.keys())
-    + ["access_item"]
-)
-
-cols_to_remove = [
-    "apps_reviewed_by_manager",
-    "manager_response",
-    "manager_response_date",
-    "ticket_creation_date",
-    "ticket_no",
-    "control_as_per_ticket",
-    "qc_status",
-    "send_mail",
-    "comment",
-    "evidence",
-    "within_30_days",
-    "approved_by_manager",
-    "failure_reason",
-    "business_justification",
-    "attachments",
-    "peer_review_status",
-    "peer_review_by",
-    "peer_review_date",
-    "peer_review_comment",
-    "provisioning_employee_deletion_date",
-]
-
-boolean_cols = ["send_mail", "within_30_days", "approved_by_manager"]
-
-oracle_send_mail = ["Yes", "No"]
+SUPPORTED_EXTENSIONS = {".ipynb", ".md"}
+_SESSION_KEY = pytest.StashKey[requests.Session]()
 
 
-def run(context: Dict) -> Dict:
-    IO_object = IOLayer()
-    final_df = {}
-    result_transfer = {}
+@dataclass(frozen=True)
+class Link:
+    """A link and the label used in pytest output."""
 
-    delta_yes = context["delta_oracle_yes"]
-    properties = context["properties"]
-    application_column = properties.get(
-        "oracle_responsibility_column",
-        "Responsibility" if "Responsibility" in delta_yes.columns else "Access_Item",
-    )
-
-    oracle_pdf_data = context.get("oracle_pdf_data")
-    if oracle_pdf_data is None:
-        oracle_pdf_data, pdf_parse_issues = get_oracle_pdf_data(
-            properties["input_files"]["pdf_report"]
-        )
-    else:
-        pdf_parse_issues = context.get(
-            "oracle_pdf_issues",
-            pd.DataFrame(columns=["Page", "Issue"]),
-        )
-
-    context["oracle_pdf_data"] = oracle_pdf_data
-    context["oracle_pdf_issues"] = pdf_parse_issues
-
-    validation_data = merge_oracle_pdf_data(
-        delta_yes,
-        oracle_pdf_data,
-        pdf_parse_issues,
-        application_column,
-    )
-    validation_data = validation_data[
-        validation_data["_pdf_merge"] == "both"
-    ].drop_duplicates(
-        subset=["_oracle_lan_id", "_oracle_responsibility"]
-    ).set_index(
-        ["_oracle_lan_id", "_oracle_responsibility"]
-    )
-
-    final_t_oracle = delta_yes.copy()
-    if not delta_yes.empty:
-        final_t_oracle = delta_yes.apply(
-            qc_transfer_oracle,
-            validation=validation_data,
-            context=context,
-            column_id_name="User Name",
-            application_column=application_column,
-            axis=1,
-        )
-
-    final_t_oracle = finalize_oracle_dataframe(
-        final_t_oracle,
-        application_column,
-        context,
-    )
-    result_transfer["Oracle"] = get_qc_status_count(final_t_oracle)
-
-    result = pd.DataFrame.from_dict(result_transfer, orient="index")
-    result.index.name = "application_name"
-    result.reset_index(inplace=True)
-
-    oracle_current_report_date = context["oracle_current_report_date"]
-    oracle_next_report_date = context["oracle_next_report_date"]
-    transfer_report_date = context["transfer_report_date"]
-
-    input_files = properties["input_files"]
-    used_sheet_names = {
-        "qc_result", "oracle_pdf_data", "pdf_parse_issues", "qc_oracle",
-    }
-    transfer_sheet_name = get_input_sheet_name(
-        input_files.get("transfer_report", "tran"),
-        transfer_report_date,
-        used_sheet_names,
-    )
-    current_sheet_name = get_input_sheet_name(
-        input_files.get("oracle_current_week_report", "oracle"),
-        oracle_current_report_date,
-        used_sheet_names,
-    )
-    next_sheet_name = get_input_sheet_name(
-        input_files.get("oracle_next_week_report", "next_oracle"),
-        oracle_next_report_date,
-        used_sheet_names,
-    )
-
-    final_df["qc_result"] = result
-    final_df[transfer_sheet_name] = context["transfer"]
-    final_df[current_sheet_name] = context[
-        "delta_oracle"
-    ].drop(columns=cols_to_remove, errors="ignore")
-    final_df[next_sheet_name] = context["next_oracle"]
-    final_df["oracle_pdf_data"] = oracle_pdf_data
-    final_df["pdf_parse_issues"] = pdf_parse_issues
-    final_df["qc_oracle"] = final_t_oracle
-
-    try:
-        output_path = properties["output_path"]
-        if not output_path.startswith(("s3://", "http://", "https://")):
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        IO_object.write_excel(
-            destination_path=output_path,
-            data=final_df,
-        )
-        logger.info(
-            "Oracle output written to %s",
-            properties["output_path"],
-        )
-    except Exception:
-        logger.exception("Failed to write Oracle output")
-        raise
-
-    context["oracle_validation_results"] = final_df
-
-    if properties.get("write_to_database", False) is True and not final_t_oracle.empty:
-        write_to_db(final_t_oracle)
-
-    return context
+    label: str
+    target: str
 
 
-def get_input_sheet_name(file_path, report_date, used_names):
-    """Use the input filename and report date within Excel's 31-character limit."""
-    name = Path(str(file_path).replace("\\", "/")).stem
-    parsed_date = pd.to_datetime(report_date, errors="coerce")
-    date_suffix = ""
-    if pd.notna(parsed_date):
-        for fmt in (
-            "%Y-%m-%d", "%m-%d-%Y", "%m_%d_%Y", "%Y_%m_%d",
-            "%Y%m%d", "%m%d%Y", "%m.%d.%Y",
-        ):
-            name = re.sub(
-                rf"(?<!\d){re.escape(parsed_date.strftime(fmt))}(?!\d)",
-                "",
-                name,
-            )
-        date_suffix = parsed_date.strftime("_%Y-%m-%d")
+class BrokenLinkError(Exception):
+    """Describe why a link check failed."""
 
-    name = re.sub(r"[\[\]:*?/\\\x00-\x1f]", "_", name).strip(" '_-.") or "Report"
-    existing_names = {sheet.casefold() for sheet in used_names}
-    number = 1
-    while True:
-        counter = f"_{number}" if number > 1 else ""
-        prefix_length = 31 - len(counter) - len(date_suffix)
-        prefix = name[:prefix_length].rstrip(" '_-.") or "Report"
-        sheet_name = f"{prefix}{counter}{date_suffix}"
-        if sheet_name.casefold() not in existing_names and sheet_name.casefold() != "history":
-            used_names.add(sheet_name)
-            return sheet_name
-        number += 1
+    def __init__(self, target: str, reason: str) -> None:
+        super().__init__(reason)
+        self.target = target
+        self.reason = reason
 
 
-def get_oracle_pdf_data(path):
-    """Read one PDF or combine a folder's PDFs using the existing connector."""
-    source = Path(path)
-    is_folder = source.is_dir()
-    pdf_files = sorted(
-        file
-        for file in source.iterdir()
-        if file.is_file() and file.suffix.lower() == ".pdf"
-    ) if is_folder else [source]
-    pdf_data_frames = []
-    pdf_issue_frames = []
+def links_from_html(label: str, html: str) -> Iterator[Link]:
+    """Extract HTTP and relative links from rendered HTML."""
+    parsed = html5lib.parse(html, namespaceHTMLElements=False)
+    attributes = {"a": "href", "iframe": "src", "img": "src"}
 
-    for pdf_file in pdf_files:
-        try:
-            pdf_data, pdf_issues = extract_oracle_pdf(str(pdf_file))
-        except Exception as e:
-            logger.exception("Unable to extract Oracle PDF %s", pdf_file)
-            pdf_issue_frames.append(pd.DataFrame([{
-                "Page": pdf_file.name,
-                "Issue": f"Unable to extract PDF: {e}",
-            }], columns=ISSUE_COLUMNS))
+    for element in parsed.iter():
+        attribute = attributes.get(element.tag)
+        if attribute is None:
             continue
 
-        pdf_data = pdf_data.copy()
-        pdf_issues = pdf_issues.copy()
-        # Keep page references distinct across PDF files.
-        if is_folder:
-            for frame in (pdf_data, pdf_issues):
-                frame["Page"] = frame["Page"].map(
-                    lambda page: f"{pdf_file.name} / page {page}"
-                )
+        target = element.get(attribute)
+        if not target or target.startswith("#"):
+            continue
 
-        pdf_data_frames.append(pdf_data)
-        pdf_issue_frames.append(pdf_issues)
+        scheme = urlsplit(target).scheme.lower()
+        if scheme and scheme not in {"http", "https"}:
+            continue
 
-    if not pdf_files:
-        pdf_issue_frames.append(pd.DataFrame([{
-            "Page": "",
-            "Issue": f"No PDF files found in: {source}",
-        }], columns=ISSUE_COLUMNS))
-
-    oracle_pdf_data = (
-        pd.concat(pdf_data_frames, ignore_index=True)
-        if pdf_data_frames
-        else pd.DataFrame(columns=PDF_COLUMNS)
-    )
-    pdf_parse_issues = (
-        pd.concat(pdf_issue_frames, ignore_index=True)
-        if pdf_issue_frames
-        else pd.DataFrame(columns=ISSUE_COLUMNS)
-    )
-    return oracle_pdf_data, pdf_parse_issues
+        yield Link(
+            label=f"{label} <{element.tag} {attribute}={target}>",
+            target=target,
+        )
 
 
-def merge_oracle_pdf_data(
-    delta_yes,
-    validation,
-    pdf_parse_issues,
-    application_column,
-):
-    """Left-merge by LAN ID and responsibility without multiplying QC rows."""
-    oracle_data = delta_yes.copy()
-    oracle_data["_oracle_lan_id"] = oracle_data["User Name"].map(clean)
-    oracle_data["_oracle_responsibility"] = oracle_data[application_column].map(clean)
+def links_from_file(path: Path) -> Iterator[Link]:
+    """Extract links from a Markdown file or Markdown notebook cells."""
+    if path.suffix.lower() == ".md":
+        yield from links_from_html(str(path), markdown2html(path.read_text(encoding="utf-8")))
+        return
 
-    pdf_data = validation.copy()
-    pdf_data["_oracle_lan_id"] = pdf_data["LAN ID"].map(clean)
-    pdf_data["_oracle_responsibility"] = pdf_data["Responsibility"].map(clean)
-    pdf_data["_pdf_has_issues"] = False
-    if not pdf_parse_issues.empty:
-        pdf_data["_pdf_has_issues"] = pdf_data["Page"].isin(pdf_parse_issues["Page"])
-
-    pdf_data = pdf_data[
-        pdf_data["_oracle_lan_id"].ne("")
-        & pdf_data["_oracle_responsibility"].ne("")
-    ]
-
-    # Preserve conflicting PDF actions so they require Manual QC.
-    pdf_data = pdf_data.groupby(
-        ["_oracle_lan_id", "_oracle_responsibility"],
-        as_index=False,
-        sort=False,
-    ).agg(
-        _pdf_actions=("Action", lambda values: tuple(dict.fromkeys(values.map(text)))),
-        _pdf_pages=("Page", lambda values: tuple(dict.fromkeys(values.map(text)))),
-        _pdf_has_issues=("_pdf_has_issues", "any"),
-    )
-
-    return pd.merge(
-        oracle_data,
-        pdf_data,
-        on=["_oracle_lan_id", "_oracle_responsibility"],
-        how="left",
-        sort=False,
-        indicator="_pdf_merge",
-    )
+    notebook = nbformat.read(path, as_version=4)
+    for cell_number, cell in enumerate(notebook.cells):
+        if cell.cell_type != "markdown":
+            continue
+        yield from links_from_html(f"Cell {cell_number}", markdown2html(cell.source))
 
 
-def finalize_oracle_dataframe(data_frame, application_column, context):
-    """Apply the same post-validation sequence used by ClaimsOps."""
-    data_frame = convert_within_30_to_yes_no(data_frame)
-    data_frame = apply_preprocessing_columns(
-        data_frame.copy(),
-        land_id_colname="User Name",
-        access_item_cols=[application_column],
-        sub_app_name="Oracle",
-    )
-    data_frame["id"] = [
-        str(uuid.uuid4()) for _ in range(len(data_frame))
-    ]
-    data_frame["title"] = "Oracle"
-    data_frame["control"] = "Transfer"
-    data_frame["active_user_report_date"] = context["oracle_current_report_date"]
-    data_frame["active_inactive_transfer_report_date"] = context[
-        "transfer_report_date"
-    ]
-    data_frame["row_added_on_date"] = date.today()
-    data_frame["month"] = pd.Timestamp(
-        context["oracle_current_report_date"]
-    ).strftime("%B")
-    data_frame = get_filtered_datacolumn(data_frame=data_frame)
-    data_frame = format_model_date_columns_mmddyyyy(data_frame)
-    data_frame = normalize_yes_no_to_bool(data_frame, boolean_cols)
-    return data_frame
+def is_ignored(target: str, patterns: list[str]) -> bool:
+    """Return whether any configured regular expression matches a target."""
+    return any(re.match(pattern, target) for pattern in patterns)
 
 
-def get_qc_status_count(data_frame):
-    return data_frame["qc_status"].value_counts().reindex(
-        ["Passed", "Manual QC"],
-        fill_value=0,
-    )
+def local_link_error(source: Path, target: str) -> str | None:
+    """Return an error for a missing relative target, otherwise ``None``."""
+    parsed = urlsplit(target)
+    target_path = unquote(parsed.path)
 
+    if not target_path:
+        return None
+    if target_path.startswith("/"):
+        return "absolute path link"
 
-def write_to_db(data):
-    """
-    Write data to db.
-
-    Params:
-        data: pd.DataFrame :: validated Oracle rows to write to db
-    """
-    io_layer = IOLayer()
-    try:
-        records = []
-        clean_data = data.astype(object).where(pd.notnull(data), None)
-        for _, row in clean_data.iterrows():
-            employee_access_review = EmployeeAccessReview(
-                id=row["id"],
-                lan_id=row.get("lan_id"),
-                first_name=row.get("first_name", ""),
-                last_name=row.get("last_name") or "",
-                email_address=row.get("email_address"),
-                emp_effective_termination_transfer_date=_parse_date(
-                    row.get("emp_effective_termination_transfer_date")
-                ),
-                title=row.get("title"),
-                subapplication=row.get("subapplication"),
-                control=row.get("control"),
-                month=row.get("month"),
-                row_added_on_date=_parse_date(row.get("row_added_on_date")),
-                active_inactive_transfer_report_date=_parse_date(
-                    row.get("active_inactive_transfer_report_date")
-                ),
-                active_user_report_date=_parse_date(
-                    row.get("active_user_report_date")
-                ),
-                provisioning_employee_deletion_date=_parse_date(
-                    row.get("provisioning_employee_deletion_date")
-                ),
-                apps_reviewed_by_manager=row.get("apps_reviewed_by_manager", ""),
-                manager_response=row.get("manager_response", ""),
-                manager_response_date=_parse_date(row.get("manager_response_date")),
-                ticket_no=row.get("ticket_no", ""),
-                ticket_creation_date=_parse_date(row.get("ticket_creation_date")),
-                control_as_per_ticket=row.get("control_as_per_ticket", ""),
-                qc_status=row.get("qc_status")
-                if row.get("qc_status") in ["Passed", "Manual QC"]
-                else QC_Status.MANUAL_QC,
-                send_mail=("Yes" if row["send_mail"] else "No")
-                if row.get("send_mail") is not None
-                else None,
-                comment=row.get("comment", ""),
-                evidence=row.get("evidence", ""),
-                within_30_days=row.get("within_30_days"),
-                approved_by_manager=row.get("approved_by_manager"),
-                failure_reason=row.get("failure_reason", ""),
-                business_justification=row.get("business_justification", ""),
-                remarks=row.get("remarks", ""),
-                attachments=row.get("attachments", ""),
-                peer_review_comment=row.get("peer_review_comment", ""),
-                peer_review_status=row.get("peer_review_status", ""),
-                peer_review_by=row.get("peer_review_by", ""),
-                peer_review_date=_parse_date(row.get("peer_review_date")),
-            )
-            record = employee_access_review.model_dump()
-            record["access_item"] = row.get("access_item")
-            records.append(record)
-
-        if records:
-            io_layer.write_to_database(records)
-            logger.info("Successfully wrote %s Oracle rows to the database", len(records))
-        else:
-            logger.info("No Oracle records to write to the database")
-    except Exception:
-        logger.exception("Failed to write Oracle records to the database")
-        raise
-
-
-def _parse_date(value: str):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    candidate = source.parent / target_path
+    if candidate.exists():
         return None
 
-    value = str(value).strip()
-    if not value:
+    if candidate.suffix == ".html":
+        for extension in SUPPORTED_EXTENSIONS:
+            if candidate.with_suffix(extension).exists():
+                return None
+
+    return f"No such file: {candidate}"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register link-checker options."""
+    group = parser.getgroup("link checker")
+    group.addoption("--check-links", action="store_true", help="Check links for validity")
+    group.addoption(
+        "--check-links-ignore",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Ignore targets matching this regular expression; may be repeated",
+    )
+    group.addoption(
+        "--check-links-timeout",
+        type=float,
+        default=float(os.environ.get("CHECK_LINKS_TIMEOUT", "10")),
+        metavar="SECONDS",
+        help="Timeout for each HTTP request",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Create one HTTP session for the test run."""
+    if not config.getoption("check_links"):
+        return
+
+    session = requests.Session()
+    session.headers["User-Agent"] = "LLMs-from-scratch-link-checker"
+    config.stash[_SESSION_KEY] = session
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Close the shared HTTP session."""
+    session = config.stash.get(_SESSION_KEY, None)
+    if session is not None:
+        session.close()
+
+
+def pytest_collect_file(file_path: Path, parent: pytest.Collector) -> LinkFile | None:
+    """Collect supported documentation files when link checking is enabled."""
+    if not parent.config.getoption("check_links"):
+        return None
+    if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
         return None
 
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%m/%d/%Y %I:%M:%S %p",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y",
-        "%d/%m/%Y",
-        "%Y/%m/%d",
-    ):
+    return LinkFile.from_parent(parent, path=file_path)
+
+
+class LinkFile(pytest.File):
+    """Collect one pytest item per link in a documentation file."""
+
+    def collect(self) -> Iterator[LinkItem]:
+        patterns = self.config.getoption("check_links_ignore")
+        for link in links_from_file(self.path):
+            if is_ignored(link.target, patterns):
+                continue
+            yield LinkItem.from_parent(self, name=link.label, target=link.target)
+
+
+class LinkItem(pytest.Item):
+    """Validate one HTTP or relative link."""
+
+    def __init__(self, *, target: str, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.target = target
+
+    def runtest(self) -> None:
+        parsed = urlsplit(self.target)
+        if parsed.scheme in {"http", "https"}:
+            self._check_http_link(parsed._replace(fragment="").geturl())
+            return
+
+        error = local_link_error(self.path, self.target)
+        if error is not None:
+            raise BrokenLinkError(self.target, error)
+
+    def _check_http_link(self, target: str) -> None:
+        session = self.config.stash[_SESSION_KEY]
+        timeout = self.config.getoption("check_links_timeout")
+
         try:
-            return datetime.strptime(value.strip(), fmt).date()
-        except ValueError:
-            continue
+            response = session.get(target, timeout=timeout)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            raise BrokenLinkError(self.target, str(error)) from error
 
-    return value.strip()
+    def repr_failure(self, excinfo: pytest.ExceptionInfo[BaseException]) -> str:
+        """Report concise link failures."""
+        if isinstance(excinfo.value, BrokenLinkError):
+            return f"{excinfo.value.target}: {excinfo.value.reason}"
+        return super().repr_failure(excinfo)
 
-
-def qc_transfer_oracle(
-    row,
-    validation: pd.DataFrame,
-    context: dict,
-    column_id_name: str,
-    application_column: str,
-):
-    manager_response = ""
-    out_comment = ""
-    curr_qc_status = "Manual QC"
-    send_mail = oracle_send_mail[0]
-    failure_reason_data = []
-
-    row["evidence"] = ""
-    row["provisioning_employee_deletion_date"] = None
-    row["within_30_days"] = None
-    row["approved_by_manager"] = None
-
-    try:
-        if clean(row["Status"]) == "yes":
-            lan_id = clean(row[column_id_name])
-            responsibility = clean(row[application_column])
-            val_clean = validation
-            lookup_key = (lan_id, responsibility)
-
-            if not lan_id or not responsibility:
-                out_comment = "LAN ID or responsibility is blank"
-                failure_reason_data.append("MISSING_ORACLE_KEY")
-            else:
-                if lookup_key not in val_clean.index:
-                    out_comment = (
-                        "LAN ID and responsibility not present in recognized PDF data"
-                    )
-                    failure_reason_data.append("NOT_PRESENT_IN_PDF")
-                else:
-                    matching_pdf = val_clean.loc[lookup_key]
-                    decision_data = set(matching_pdf["_pdf_actions"])
-                    page_has_issues = matching_pdf["_pdf_has_issues"]
-
-                    if page_has_issues:
-                        out_comment = "Matched PDF page has parsing issues; review the form"
-                        failure_reason_data.append("PDF_PARSING_ISSUE")
-
-                    elif decision_data == {"+"}:
-                        # Add passes on the current-week match, regardless of next week.
-                        manager_response = "Keep"
-                        curr_qc_status = "Passed"
-                        send_mail = oracle_send_mail[1]
-                        out_comment = (
-                            "PDF add selection matches the current-week responsibility"
-                        )
-
-                    elif decision_data == {"-"}:
-                        # Remove passes only when next-week absence can be confirmed.
-                        manager_response = "Remove"
-                        next_week_status = check_oracle_next_week(
-                            row,
-                            context,
-                            column_id_name,
-                            application_column,
-                        )
-
-                        if next_week_status == "Present":
-                            out_comment = (
-                                "Responsibility marked for removal is present next week"
-                            )
-                            failure_reason_data.append("NEXT_WEEK_DATA_OVERLAP")
-                        elif next_week_status == "Incomplete":
-                            out_comment = (
-                                "Next-week report has blank keys; absence requires review"
-                            )
-                            failure_reason_data.append("INCOMPLETE_NEXT_WEEK_REPORT")
-                        else:
-                            curr_qc_status = "Passed"
-                            send_mail = oracle_send_mail[1]
-                            out_comment = (
-                                "Responsibility marked for removal is absent next week"
-                            )
-                            row["provisioning_employee_deletion_date"] = context[
-                                "oracle_next_report_date"
-                            ]
-                    else:
-                        out_comment = "PDF selection is unselected, unclear, or conflicting"
-                        failure_reason_data.append("INVALID_PDF_ACTION")
-
-                    pages = ", ".join(matching_pdf["_pdf_pages"])
-                    pdf_path = context["properties"]["input_files"]["pdf_report"]
-                    if Path(pdf_path).is_dir():
-                        row["evidence"] = f"{pdf_path} ({pages})"
-                    else:
-                        row["evidence"] = f"{pdf_path} (page {pages})"
-        else:
-            out_comment = "Row is not marked as a transfer match"
-            failure_reason_data.append("NOT_TRANSFER_MATCH")
-
-    except Exception as e:
-        logger.exception(f"Found exception in Oracle transfer qc_transfer_oracle: {e}")
-        curr_qc_status = "Manual QC"
-        send_mail = oracle_send_mail[0]
-        row["provisioning_employee_deletion_date"] = None
-        out_comment = "Oracle PDF validation could not be completed; manual review required"
-        failure_reason_data.append("PDF_VALIDATION_ERROR")
-
-    row["qc_status"] = curr_qc_status
-    row["comment"] = out_comment
-    row["send_mail"] = send_mail
-    row["manager_response"] = manager_response
-    row["control_as_per_ticket"] = "Transfer"
-    row["failure_reason"] = ", ".join(sorted(set(failure_reason_data)))
-
-    return row
+    def reportinfo(self) -> tuple[Path, int | None, str]:
+        """Associate failures with the source documentation file."""
+        return self.path, None, self.target
 
 
-def check_oracle_next_week(row, context, column_id_name, application_column):
-    """Follow the ClaimsOps concatenated-key pattern for a PDF removal."""
-    match_cols_curr = [column_id_name, application_column]
-    match_cols_next = [column_id_name, application_column]
-
-    curr_oracle_df = context.get("oracle")
-    if curr_oracle_df is None:
-        curr_oracle_df = context["delta_oracle"]
-    curr_oracle_df = curr_oracle_df.copy()
-    next_oracle_df = context["next_oracle"].copy()
-
-    for col in match_cols_curr:
-        curr_oracle_df[col] = curr_oracle_df[col].map(clean)
-    for col in match_cols_next:
-        next_oracle_df[col] = next_oracle_df[col].map(clean)
-
-    next_week_employees = set(next_oracle_df[column_id_name].unique())
-    exists_next_week = curr_oracle_df[column_id_name].isin(next_week_employees)
-
-    curr_keys = (
-        curr_oracle_df[column_id_name]
-        + "||"
-        + curr_oracle_df[application_column]
+def main(arguments: list[str] | None = None) -> int:
+    """Run pytest with only this documentation collector enabled."""
+    args = sys.argv[1:] if arguments is None else arguments
+    return pytest.main(
+        ["--check-links", "-p", "no:python", *args],
+        plugins=[sys.modules[__name__]],
     )
-    next_keys = set(
-        next_oracle_df[column_id_name]
-        + "||"
-        + next_oracle_df[application_column]
-    )
-    row_matches_next_week = curr_keys.isin(next_keys)
-
-    row_key = (
-        clean(row[column_id_name])
-        + "||"
-        + clean(row[application_column])
-    )
-    current_row_matches = curr_keys.eq(row_key)
-    if current_row_matches.any():
-        employee_exists = bool(exists_next_week[current_row_matches].any())
-        complete_key_exists = bool(row_matches_next_week[current_row_matches].any())
-    else:
-        employee_exists = clean(row[column_id_name]) in next_week_employees
-        complete_key_exists = row_key in next_keys
-
-    if employee_exists and complete_key_exists:
-        return "Present"
-    if (
-        next_oracle_df[column_id_name].eq("")
-        | next_oracle_df[application_column].eq("")
-    ).any():
-        return "Incomplete"
-    return "Absent"
 
 
-def convert_within_30_to_yes_no(df):
-    """Normalize the shared output column; Oracle does not calculate an SLA."""
-    if "within_30_days" not in df.columns:
-        df["within_30_days"] = None
-
-    s = pd.to_numeric(df["within_30_days"], errors="coerce")
-    df["within_30_days"] = (
-        s.where(
-            s.isna(),
-            s.map(lambda x: "YES" if x <= 30 else "NO"),
-        )
-    )
-    return df
-
-
-def _is_date_like_annotation(annotation: Any) -> bool:
-    if annotation is date:
-        return True
-    origin = get_origin(annotation)
-    if origin is Union:
-        args = [arg for arg in get_args(annotation) if arg is not type(None)]
-        return len(args) == 1 and args[0] is date
-    return False
-
-
-def get_model_date_columns() -> list:
-    models = (
-        data_model.EmployeeInfo,
-        data_model.QCColumn,
-        data_model.ManualData,
-    )
-    date_columns = []
-    for model in models:
-        for field_name, field_info in model.model_fields.items():
-            if _is_date_like_annotation(field_info.annotation):
-                date_columns.append(field_name)
-    return list(dict.fromkeys(date_columns))
-
-
-def format_model_date_columns_mmddyyyy(
-    data_frame: pd.DataFrame,
-) -> pd.DataFrame:
-    date_columns = get_model_date_columns()
-    for col in date_columns:
-        if col not in data_frame.columns:
-            continue
-        parsed_dates = pd.to_datetime(data_frame[col], errors="coerce", format="mixed")
-        data_frame[col] = parsed_dates.dt.strftime("%m/%d/%Y")
-        data_frame.loc[parsed_dates.isna(), col] = None
-    return data_frame
-
-
-def get_filtered_datacolumn(data_frame):
-    for col in all_col:
-        if col not in data_frame.columns:
-            data_frame[col] = None
-
-    final_df = data_frame[all_col]
-    return final_df
-
-
-def apply_preprocessing_columns(
-    df,
-    land_id_colname,
-    access_item_cols,
-    sub_app_name,
-):
-    if df.empty:
-        for col in all_col:
-            if col not in df.columns:
-                df[col] = None
-        return df
-
-    name_split = (
-        df["Employee Last Name,First"]
-        .fillna("")
-        .str.strip()
-        .str.split(",")
-    )
-    df["first_name"] = name_split.str[1:].str.join(" ").str.strip()
-    df["last_name"] = name_split.str[0].str.strip()
-    df["lan_id"] = df[land_id_colname].map(text)
-
-    if "Employee Email" in df.columns:
-        df["email_address"] = df["Employee Email"]
-    elif "transfer_employee_email" in df.columns:
-        df["email_address"] = df["transfer_employee_email"]
-    elif "email_address" not in df.columns:
-        df["email_address"] = ""
-
-    df["emp_effective_termination_transfer_date"] = df["Effective Date"]
-    df["access_item"] = df[access_item_cols[0]].map(text)
-    df["subapplication"] = sub_app_name
-    df["control"] = "Transfer"
-
-    return df
+if __name__ == "__main__":
+    raise SystemExit(main())
